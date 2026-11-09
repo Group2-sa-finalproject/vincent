@@ -294,11 +294,54 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 mysqli_stmt_close($stmt);
             }
 
-            mysqli_commit($conn);
+           // Update the corresponding regular route stop to collected
+$updateStop = mysqli_prepare($conn, "
+    UPDATE route_stops rs
+    INNER JOIN collection_routes cr
+        ON cr.id = rs.route_id
+    SET rs.status = 'collected'
+    WHERE rs.household_id = ?
+      AND cr.collector_id = ?
+      AND cr.route_type = 'regular'
+      AND cr.status IN ('assigned', 'in_progress')
+      AND LOWER(rs.status) = 'pending'
+");
 
-            $message = $points > 0
-                ? "Collection recorded! 5 eco-points awarded."
-                : "Collection recorded. No eco-points awarded.";
+if (!$updateStop) {
+    throw new Exception("Unable to update route stop status.");
+}
+
+mysqli_stmt_bind_param(
+    $updateStop,
+    "ii",
+    $household_id,
+    $collector_id
+);
+
+if (!mysqli_stmt_execute($updateStop)) {
+    throw new Exception("Failed to update route stop status.");
+}
+
+$updated_stops = mysqli_stmt_affected_rows($updateStop);
+
+mysqli_stmt_close($updateStop);
+
+// Commit all collection changes
+mysqli_commit($conn);
+
+$message = $points > 0
+    ? "Collection recorded! 5 eco-points awarded."
+    : "Collection recorded. No eco-points awarded.";
+
+// Include route update result
+if ($updated_stops > 0) {
+    $message .= " Route stop marked as collected.";
+}
+
+respond(true, $message, [
+    "points" => $points,
+    "updated_stops" => $updated_stops
+]);
 
             respond(true, $message, [
                 "points" => $points
