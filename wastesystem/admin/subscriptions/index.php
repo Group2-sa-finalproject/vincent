@@ -2,6 +2,7 @@
 session_start();
 
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/send_email.php';
 
 // Only administrators may access this page.
 if (!isset($_SESSION['user_id']) || ($_SESSION['role'] ?? '') !== 'admin') {
@@ -52,13 +53,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $conn->begin_transaction();
 
             // Lock the subscription row so it cannot be confirmed twice at the same time.
-            $lock_stmt = $conn->prepare("
-                SELECT id, total_amount, payment_status, subscription_status
-                FROM subscriptions
-                WHERE id = ?
-                LIMIT 1
-                FOR UPDATE
-            ");
+           $lock_stmt = $conn->prepare("
+    SELECT
+        s.id,
+        s.user_id,
+        s.total_amount,
+        s.payment_status,
+        s.subscription_status,
+        u.fullname,
+        u.email
+    FROM subscriptions s
+    INNER JOIN users u ON u.id = s.user_id
+    WHERE s.id = ?
+    LIMIT 1
+    FOR UPDATE
+");
 
             if (!$lock_stmt) {
                 throw new Exception('Unable to prepare the subscription lookup.');
@@ -136,8 +145,185 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $conn->commit();
 
-            // Rotate the token after a successful state-changing request.
-            $_SESSION['subscription_admin_csrf'] = bin2hex(random_bytes(32));
+// Rotate the token after a successful state-changing request.
+$_SESSION['subscription_admin_csrf'] = bin2hex(random_bytes(32));
+
+// Send email notification after the database transaction succeeds.
+$email_sent = false;
+
+if (
+    !empty($subscription['email']) &&
+    filter_var($subscription['email'], FILTER_VALIDATE_EMAIL)
+) {
+
+    $resident_name = htmlspecialchars(
+        $subscription['fullname'],
+        ENT_QUOTES,
+        'UTF-8'
+    );
+
+    if ($action === 'confirm') {
+
+        $email_subject = 'Subscription Payment Confirmed';
+
+        $email_body = "
+            <div style='font-family: Arial, sans-serif; color: #333; padding: 20px;'>
+
+                <h2 style='color: #198754;'>
+                    Payment Successfully Confirmed!
+                </h2>
+
+                <p>Hello <strong>{$resident_name}</strong>,</p>
+
+                <p>
+                    Good news! Your subscription payment notice has been
+                    reviewed and confirmed by the administrator.
+                </p>
+
+                <h3>Payment Details</h3>
+
+                <table cellpadding='10' cellspacing='0'
+                    style='border-collapse: collapse; width: 100%;'>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Subscription ID
+                        </td>
+                        <td style='border: 1px solid #ddd;'>
+                            {$subscription_id}
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Amount Paid
+                        </td>
+                        <td style='border: 1px solid #ddd;'>
+                            ₱" . number_format((float)$subscription['total_amount'], 2) . "
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Payment Status
+                        </td>
+                        <td style='border: 1px solid #ddd; color: #198754;'>
+                            PAID
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Subscription Status
+                        </td>
+                        <td style='border: 1px solid #ddd; color: #198754;'>
+                            ACTIVE
+                        </td>
+                    </tr>
+
+                </table>
+
+                <p style='margin-top: 20px;'>
+                    Your subscription is now active. You may now use the
+                    waste collection services covered by your subscription.
+                </p>
+
+                <p>Thank you for using our Waste Collection Management System!</p>
+
+                <hr>
+
+                <p style='font-size: 12px; color: #777;'>
+                    This is an automated notification. Please do not reply.
+                </p>
+
+            </div>
+        ";
+
+    } else {
+
+        $email_subject = 'Subscription Payment Notice Rejected';
+
+        $email_body = "
+            <div style='font-family: Arial, sans-serif; color: #333; padding: 20px;'>
+
+                <h2 style='color: #dc3545;'>
+                    Payment Notice Rejected
+                </h2>
+
+                <p>Hello <strong>{$resident_name}</strong>,</p>
+
+                <p>
+                    We regret to inform you that your subscription payment
+                    notice has been rejected by the administrator.
+                </p>
+
+                <h3>Payment Details</h3>
+
+                <table cellpadding='10' cellspacing='0'
+                    style='border-collapse: collapse; width: 100%;'>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Subscription ID
+                        </td>
+                        <td style='border: 1px solid #ddd;'>
+                            {$subscription_id}
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Amount
+                        </td>
+                        <td style='border: 1px solid #ddd;'>
+                            ₱" . number_format((float)$subscription['total_amount'], 2) . "
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style='border: 1px solid #ddd;'>
+                            Payment Status
+                        </td>
+                        <td style='border: 1px solid #ddd; color: #dc3545;'>
+                            UNPAID
+                        </td>
+                    </tr>
+
+                </table>
+
+                <p style='margin-top: 20px;'>
+                    You may submit a new payment notice through your
+                    resident account.
+                </p>
+
+                <p>
+                    If you believe this rejection was made in error,
+                    please contact the administrator.
+                </p>
+
+                <hr>
+
+                <p style='font-size: 12px; color: #777;'>
+                    Waste Collection Management System
+                </p>
+
+            </div>
+        ";
+    }
+
+    $email_sent = sendEmail(
+        $subscription['email'],
+        $email_subject,
+        $email_body
+    );
+}
+
+// Display email result to administrator.
+if ($email_sent) {
+    $success_message .= ' Resident notification email sent successfully.';
+} else {
+    $success_message .= ' However, the resident notification email could not be sent.';
+}
         } catch (Throwable $exception) {
             $conn->rollback();
             $error_message = $exception->getMessage();
